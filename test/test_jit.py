@@ -1564,6 +1564,16 @@ class TestScript(TestCase):
         x = torch.rand(10, dtype=torch.float, requires_grad=True)
         self.checkScript(func, [x], optimize=True)
 
+    def test_keyword(self):
+        @torch.jit.script
+        def func(x):
+            return torch.sum(x, dim=0, keepdim=True)
+
+        x = torch.rand(10, dtype=torch.float, requires_grad=True)
+        y = func(x)
+        y2 = torch.sum(x, dim=0, keepdim=True)
+        self.assertEqual(y, y2)
+
     def test_func_call(self):
         script = '''
         def add(a, b):
@@ -2210,7 +2220,7 @@ class TestScript(TestCase):
                 for m in self.mods:
                     print(m)
                 return v
-        with self.assertRaisesRegex(RuntimeError, "cannot be used as tuple"):
+        with self.assertRaisesRegex(RuntimeError, "cannot be used as a tuple"):
             M()
 
     class StarTestSumStarred(torch.nn.Module):
@@ -2308,7 +2318,7 @@ class TestScript(TestCase):
 
     def test_script_module_star_assign_fail_pythonop(self):
 
-        with self.assertRaisesRegex(RuntimeError, "Vararg outputs are currently not supported for PythonOp"):
+        with self.assertRaisesRegex(RuntimeError, "value cannot be used as a tuple"):
             class M2(torch.jit.ScriptModule):
                 def __init__(self):
                     super(M2, self).__init__(True)
@@ -2326,7 +2336,7 @@ class TestScript(TestCase):
             m(torch.zeros(4, 3))
 
     def test_script_module_star_assign_fail_builtin(self):
-        with self.assertRaisesRegex(RuntimeError, "Starred packing for the output of a builtin is not supported."):
+        with self.assertRaisesRegex(RuntimeError, "value cannot be used as a tuple"):
             class M2(torch.jit.ScriptModule):
                 def __init__(self):
                     super(M2, self).__init__(True)
@@ -2339,6 +2349,81 @@ class TestScript(TestCase):
 
             m = M2()
             m(torch.zeros(4, 3))
+
+    def test_rnn_trace_override(self):
+        from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+        T, B, C = 3, 5, 7
+
+        class PadPackedWrapper(torch.nn.Module):
+            def __init__(self):
+                super(PadPackedWrapper, self).__init__()
+
+            def forward(self, x, seq_lens):
+                x = pack_padded_sequence(x, seq_lens)
+                x, _ = pad_packed_sequence(x)
+                return x
+
+        x = np.ones((T, B, C))
+        seq_lens = np.array([3, 3, 2, 2, 1], dtype=np.int32)
+        # set padding value so we can test equivalence
+        for b in range(B):
+            if seq_lens[b] < T:
+                x[seq_lens[b]:, b, :] = 0
+        seq_lens = torch.from_numpy(seq_lens)
+        x = torch.autograd.Variable(torch.from_numpy(x), requires_grad=True)
+
+        m = PadPackedWrapper()
+        m_traced = torch.jit.trace(x, seq_lens)(m)
+
+        y = m(x, seq_lens)
+        loss = torch.sum(y)
+        loss.backward()
+        grad = x.grad.clone()
+        x.grad.zero_()
+
+        y_traced = m_traced(x, seq_lens)
+        loss_traced = torch.sum(y_traced)
+        loss_traced.backward()
+        grad_traced = x.grad.clone()
+
+        self.assertEqual(y_traced, x)
+        self.assertEqual(y_traced, y)
+        self.assertEqual(grad, grad_traced)
+
+        f = io.BytesIO()
+        torch.onnx._export(m, (x, seq_lens), f, verbose=False)
+
+    def test_script_outputs(self):
+        with self.assertRaisesRegex(RuntimeError, "value cannot be used as a tuple"):
+            @torch.jit.script
+            def foo(a):
+                c, d = a + a
+                return c + d
+
+        @torch.jit.script
+        def return3():
+            return 1, 2, 3
+
+        with self.assertRaisesRegex(RuntimeError, "too many values to unpack"):
+            @torch.jit.script
+            def bind2():
+                a, b = return3()
+                print(a)
+                print(b)
+
+    def test_script_chunk(self):
+        @torch.jit.script
+        def foo(a):
+            b, c = torch.chunk(a, dim=0, chunks=2)
+            return b
+        v = torch.rand(10, 3)
+        self.assertEqual(torch.chunk(v, dim=0, chunks=2)[0], foo(v))
+
+        with self.assertRaisesRegex(RuntimeError, "too many values to unpack"):
+            @torch.jit.script
+            def foo(a):
+                b, c = torch.chunk(a, dim=0, chunks=3)
+                return b
 
 
 # Smoke tests for export methods
