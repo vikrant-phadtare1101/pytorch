@@ -3,7 +3,7 @@ from torch._six import int_classes as _int_classes
 
 
 class Sampler(object):
-    """Base class for all Samplers.
+    r"""Base class for all Samplers.
 
     Every Sampler subclass has to provide an __iter__ method, providing a way
     to iterate over indices of dataset elements, and a __len__ method that
@@ -21,7 +21,7 @@ class Sampler(object):
 
 
 class SequentialSampler(Sampler):
-    """Samples elements sequentially, always in the same order.
+    r"""Samples elements sequentially, always in the same order.
 
     Arguments:
         data_source (Dataset): dataset to sample from
@@ -38,7 +38,7 @@ class SequentialSampler(Sampler):
 
 
 class RandomSampler(Sampler):
-    """Samples elements randomly, without replacement.
+    r"""Samples elements randomly, without replacement.
 
     Arguments:
         data_source (Dataset): dataset to sample from
@@ -55,7 +55,7 @@ class RandomSampler(Sampler):
 
 
 class SubsetRandomSampler(Sampler):
-    """Samples elements randomly from a given list of indices, without replacement.
+    r"""Samples elements randomly from a given list of indices, without replacement.
 
     Arguments:
         indices (list): a list of indices
@@ -72,7 +72,7 @@ class SubsetRandomSampler(Sampler):
 
 
 class WeightedRandomSampler(Sampler):
-    """Samples elements from [0,..,len(weights)-1] with given probabilities (weights).
+    r"""Samples elements from [0,..,len(weights)-1] with given probabilities (weights).
 
     Arguments:
         weights (list)   : a list of weights, not necessary summing up to one
@@ -88,8 +88,8 @@ class WeightedRandomSampler(Sampler):
             raise ValueError("num_samples should be a positive integeral "
                              "value, but got num_samples={}".format(num_samples))
         if not isinstance(replacement, bool):
-            raise ValueError("replacement should be a boolean value, but got"
-                             "got replacement={}".format(replacement))
+            raise ValueError("replacement should be a boolean value, but got "
+                             "replacement={}".format(replacement))
         self.weights = torch.tensor(weights, dtype=torch.double)
         self.num_samples = num_samples
         self.replacement = replacement
@@ -102,7 +102,7 @@ class WeightedRandomSampler(Sampler):
 
 
 class BatchSampler(object):
-    """Wraps another sampler to yield a mini-batch of indices.
+    r"""Wraps another sampler to yield a mini-batch of indices.
 
     Args:
         sampler (Sampler): Base sampler.
@@ -127,8 +127,8 @@ class BatchSampler(object):
             raise ValueError("batch_size should be a positive integeral value, "
                              "but got batch_size={}".format(batch_size))
         if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value, but got"
-                             "got drop_last={}".format(drop_last))
+            raise ValueError("drop_last should be a boolean value, but got "
+                             "drop_last={}".format(drop_last))
         self.sampler = sampler
         self.batch_size = batch_size
         self.drop_last = drop_last

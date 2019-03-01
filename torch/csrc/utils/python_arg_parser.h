@@ -20,7 +20,7 @@
 //   }
 
 
-#include <Python.h>
+#include "torch/csrc/python_headers.h"
 #include <string>
 #include <sstream>
 #include <vector>
@@ -33,6 +33,7 @@
 #include "torch/csrc/Generator.h"
 #include "torch/csrc/autograd/python_variable.h"
 #include "torch/csrc/autograd/generated/VariableType.h"
+#include "torch/csrc/jit/tracer.h"
 #include "torch/csrc/tensor/python_tensor.h"
 #include "torch/csrc/utils/device.h"
 #include "torch/csrc/utils/object_ptr.h"
@@ -44,7 +45,7 @@ namespace torch {
 
 enum class ParameterType {
   TENSOR, SCALAR, INT64, DOUBLE, TENSOR_LIST, INT_LIST, GENERATOR,
-  BOOL, STORAGE, PYOBJECT, DTYPE, LAYOUT, DEVICE, STRING
+  BOOL, STORAGE, PYOBJECT, SCALARTYPE, LAYOUT, DEVICE, STRING
 };
 
 struct FunctionParameter;
@@ -58,7 +59,7 @@ struct ParsedArgs {
 };
 
 struct PythonArgParser {
-  explicit PythonArgParser(std::vector<std::string> fmts);
+  explicit PythonArgParser(std::vector<std::string> fmts, bool traceable=false);
 
   template<int N>
   inline PythonArgs parse(PyObject* args, PyObject* kwargs, ParsedArgs<N>& dst);
@@ -71,15 +72,18 @@ private:
   std::vector<FunctionSignature> signatures_;
   std::string function_name;
   ssize_t max_args;
+  bool traceable;
 };
 
 struct PythonArgs {
-  PythonArgs(int idx, const FunctionSignature& signature, PyObject** args)
+  PythonArgs(int idx, bool traceable, const FunctionSignature& signature, PyObject** args)
     : idx(idx)
+    , traceable(traceable)
     , signature(signature)
     , args(args) {}
 
   int idx;
+  bool traceable;
   const FunctionSignature& signature;
   PyObject** args;
 
@@ -93,11 +97,15 @@ struct PythonArgs {
   inline std::vector<int64_t> intlistWithDefault(int i, std::vector<int64_t> default_intlist);
   inline at::Generator* generator(int i);
   inline std::unique_ptr<at::Storage> storage(int i);
-  inline const THPDtype& dtype(int i);
-  inline const THPDtype& dtypeWithDefault(int i, const THPDtype& default_dtype);
+  inline at::ScalarType scalartype(int i);
+  inline at::ScalarType scalartypeWithDefault(int i, at::ScalarType default_scalartype);
+  inline at::optional<at::ScalarType> scalartypeOptional(int i);
   inline const THPLayout& layout(int i);
+  inline const THPLayout& layoutWithDefault(int i, const THPLayout& default_layout);
   inline Device device(int i);
+  inline Device deviceWithDefault(int i, const Device& default_device);
   inline int64_t deviceInt64(int i);
+  inline at::optional<Device> deviceOptional(int i);
   inline std::string string(int i);
   inline PyObject* pyobject(int i);
   inline int64_t toInt64(int i);
@@ -146,7 +154,7 @@ struct FunctionParameter {
     bool default_bool;
     int64_t default_int;
     double default_double;
-    THPDtype* default_dtype;
+    at::ScalarType default_scalartype;
     THPLayout* default_layout;
   };
 };
@@ -238,7 +246,7 @@ inline std::vector<int64_t> PythonArgs::intlistWithDefault(int i, std::vector<in
   PyObject* arg = args[i];
   auto size = signature.params[i].size;
   if (size > 0 && THPUtils_checkLong(arg)) {
-    return std::vector<int64_t>(size, THPUtils_unpackLong(arg));
+    return std::vector<int64_t>(size, THPUtils_unpackIndex(arg));
   }
   auto tuple = PyTuple_Check(arg);
   size = tuple ? PyTuple_GET_SIZE(arg) : PyList_GET_SIZE(arg);
@@ -246,7 +254,17 @@ inline std::vector<int64_t> PythonArgs::intlistWithDefault(int i, std::vector<in
   for (int idx = 0; idx < size; idx++) {
     PyObject* obj = tuple ? PyTuple_GET_ITEM(arg, idx) : PyList_GET_ITEM(arg, idx);
     try {
-      res[idx] = THPUtils_unpackLong(obj);
+      // Elements of torch.Size are tensors during tracing, and we need to record extra
+      // information before they are turned into an IntList
+      if (traceable && THPVariable_Check(obj)) {
+        auto & var = THPVariable_Unpack(obj);
+        jit::tracer::ArgumentStash::stashIntListElem(
+            signature.params[i].name, size, idx, var);
+        res[idx] = var.toCLong();
+        continue;
+      } else {
+        res[idx] = THPUtils_unpackIndex(obj);
+      }
     } catch (std::runtime_error &e) {
       throw TypeError("%s(): argument '%s' must be %s, but found element of type %s at pos %d",
           signature.name.c_str(), signature.params[i].name.c_str(),
@@ -256,26 +274,33 @@ inline std::vector<int64_t> PythonArgs::intlistWithDefault(int i, std::vector<in
   return res;
 }
 
-inline const THPDtype& PythonArgs::dtypeWithDefault(int i, const THPDtype& default_dtype) {
-  if (!args[i]) return default_dtype;
-  return dtype(i);
+inline at::ScalarType PythonArgs::scalartypeWithDefault(int i, at::ScalarType default_scalartype) {
+  if (!args[i]) return default_scalartype;
+  return scalartype(i);
 }
 
-inline const THPDtype& PythonArgs::dtype(int i) {
+inline at::ScalarType PythonArgs::scalartype(int i) {
   if (!args[i]) {
-    auto dtype = signature.params[i].default_dtype;
-    if (!dtype) {
-      const auto& type = torch::tensor::get_default_tensor_type();
-      dtype = torch::getDtype(type.scalarType(), type.is_cuda());
-    }
-    return *dtype;
+    auto scalartype = signature.params[i].default_scalartype;
+    return (scalartype == at::ScalarType::Undefined) ?
+            torch::tensor::get_default_tensor_type().scalarType() : scalartype;
   }
-  return *reinterpret_cast<THPDtype*>(args[i]);
+  return reinterpret_cast<THPDtype*>(args[i])->scalar_type;
+}
+
+inline at::optional<at::ScalarType> PythonArgs::scalartypeOptional(int i) {
+  if (!args[i]) return at::nullopt;
+  return scalartype(i);
 }
 
 inline const THPLayout& PythonArgs::layout(int i) {
   if (!args[i]) return *signature.params[i].default_layout;
   return *reinterpret_cast<THPLayout*>(args[i]);
+}
+
+inline const THPLayout& PythonArgs::layoutWithDefault(int i, const THPLayout& default_layout) {
+  if (!args[i]) return default_layout;
+  return layout(i);
 }
 
 static std::string cuda_str = "cuda";
@@ -284,7 +309,11 @@ static std::string cuda_prefix = "cuda:";
 static std::string cpu_prefix = "cpu:";
 
 inline Device PythonArgs::device(int i) {
-  if (!args[i]) return Device(DeviceType::CPU, -1, true);  // TODO: use CUDA if default type is a cuda type.
+  if (!args[i]) {
+    const auto& default_tensor_type = torch::tensor::get_default_tensor_type();
+    const auto device_type = torch::getDeviceType(default_tensor_type);
+    return Device(device_type, -1, true);
+  }
   if (THPDevice_Check(args[i])) {
     auto device = reinterpret_cast<THPDevice*>(args[i]);
     return device->device;
@@ -308,9 +337,19 @@ inline Device PythonArgs::device(int i) {
   throw torch::TypeError("only \"cuda\" and \"cpu\" are valid device types, got %s", device_str.c_str());
 }
 
+inline Device PythonArgs::deviceWithDefault(int i, const Device& default_device) {
+  if (!args[i]) return default_device;
+  return device(i);
+}
+
 inline int64_t PythonArgs::deviceInt64(int i) {
   auto dev = device(i);
-  return (dev.is_default || dev.type == DeviceType::CPU) ? -1 : dev.index;
+  return dev.deviceInt64();
+}
+
+inline at::optional<Device> PythonArgs::deviceOptional(int i) {
+  if (!args[i]) return at::nullopt;
+  return device(i);
 }
 
 inline std::string PythonArgs::string(int i) {

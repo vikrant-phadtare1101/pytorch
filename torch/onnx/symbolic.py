@@ -6,8 +6,13 @@ from torch.nn.utils.rnn import PackedSequence
 import warnings
 
 import torch.onnx
+# This import monkey-patches graph manipulation methods on Graph, used for the
+# ONNX symbolics
+import torch.onnx.utils
 
+from collections import Iterable
 from functools import partial
+import itertools
 
 # EDITING THIS FILE? READ THIS FIRST!
 #
@@ -54,6 +59,10 @@ def _broadcast_if_scalar(x):
         return {}
     else:
         return {"broadcast_i": 1}
+
+
+def _is_value(x):
+    return isinstance(x, torch._C.Value)
 
 
 def _unimplemented(op, msg):
@@ -150,6 +159,10 @@ def div(g, self, other):
     return g.op("Div", self, _if_scalar_type_as(other, self), **_broadcast_if_scalar(other))
 
 
+def reciprocal(g, self):
+    return g.op("Div", _if_scalar_type_as(torch.ones(1), self), self, broadcast_i=1)
+
+
 # This syntax is Python 2 portable
 def cat(g, *tensors, **kwargs):
     dim = kwargs.pop("dim")
@@ -207,7 +220,9 @@ def sum(g, self, dim=None, keepdim=None):
         return g.op("Sum", self)
     if keepdim is None:
         keepdim = 0
-    return g.op("ReduceSum", self, axes_i=[dim], keepdims_i=keepdim)
+    if isinstance(dim, numbers.Number):
+        dim = [dim]
+    return g.op("ReduceSum", self, axes_i=dim, keepdims_i=keepdim)
 
 
 def cumsum(g, input, dim):
@@ -255,6 +270,13 @@ def embedding_bag(g,
                 sparse_i=sparse)
 
 
+def size(g, self, dim):
+    if _is_value(dim):
+        raise RuntimeError("ONNX export only supports constant dim values in .size()")
+    full_shape = g.op("Shape", self)
+    return select(g, full_shape, dim=0, index=dim)
+
+
 def transpose(g, self, dim0, dim1):
     if dim0 == dim1:  # micro-optimization
         return self
@@ -272,11 +294,25 @@ def permute(g, self, dims):
 
 
 def view(g, self, size):
-    self_sizes = self.type().sizes()
-    if self_sizes and len(size) == 2 and self_sizes[0] == size[0]:
-        return g.op("Flatten", self, axis_i=1)
-    shape = g.op("Constant", value_t=torch.LongTensor(size))
+    if _is_value(size):
+        shape = size
+    else:
+        if self.isTensor():
+            self_sizes = self.type().sizes()
+            if self_sizes and len(size) == 2 and self_sizes[0] == size[0]:
+                return g.op("Flatten", self, axis_i=1)
+        shape = g.op("Constant", value_t=torch.LongTensor(size))
     return g.op("Reshape", self, shape)
+
+
+def stack(g, *tensors, **kwargs):
+    dim = kwargs.pop('dim')
+    if kwargs:
+        raise RuntimeError("Unexpected kwargs: " + ','.join(kwargs.keys()))
+    if len(tensors) < 2:
+        raise RuntimeError("Expected at least two arguments to stack node")
+    unsqueezed = [g.op("Unsqueeze", t, axes_i=[dim]) for t in tensors]
+    return g.op("Concat", *unsqueezed, axis_i=dim)
 
 
 def split(g, self, split_size, dim):
@@ -401,28 +437,45 @@ def max_pool2d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     return r, None
 
 
-def avg_pool2d(g, input, kernel_size, stride, padding, ceil_mode, count_include_pad):
+def max_pool3d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     if ceil_mode:
-        return _unimplemented("avg_pool2d", "ceil_mode")
+        return _unimplemented("max_pool3d", "ceil_mode")
+    if set(_triple(dilation)) != {1}:
+        return _unimplemented("max_pool3d", "dilation")
     if not stride:
         stride = kernel_size
-    # TODO: What about count_include_pad?!
-    return g.op("AveragePool", input,
-                kernel_shape_i=_pair(kernel_size),
-                strides_i=_pair(stride),
-                pads_i=_pair(padding) * 2)
+    r = g.op("MaxPool", input,
+             kernel_shape_i=_triple(kernel_size),
+             pads_i=_triple(padding) * 2,
+             strides_i=_triple(stride))
+    return r, None
 
 
-def avg_pool3d(g, input, kernel_size, stride, padding, ceil_mode, count_include_pad):
-    if ceil_mode:
-        return _unimplemented("avg_pool3d", "ceil_mode")
-    if not stride:
-        stride = kernel_size
-    # TODO: What about count_include_pad?!
-    return g.op("AveragePool", input,
-                kernel_shape_i=_triple(kernel_size),
-                strides_i=_triple(stride),
-                pads_i=_triple(padding) * 2)
+def _avg_pool(name, tuple_fn):
+    def symbolic_fn(g, input, kernel_size, stride, padding, ceil_mode, count_include_pad):
+        if ceil_mode:
+            return _unimplemented("avg_pool2d", "ceil_mode")
+        if not stride:
+            stride = kernel_size
+
+        padding = tuple(tuple_fn(padding))
+        if count_include_pad:
+            input = g.op("Pad", input,
+                         pads_i=((0,) * 2 + padding) * 2,
+                         mode_s='constant',
+                         value_f=0.)
+            padding = (0,) * len(padding)
+
+        return g.op("AveragePool", input,
+                    kernel_shape_i=tuple_fn(kernel_size),
+                    strides_i=tuple_fn(stride),
+                    pads_i=padding * 2)
+    return symbolic_fn
+
+
+avg_pool1d = _avg_pool('avg_pool1d', _single)
+avg_pool2d = _avg_pool('avg_pool2d', _pair)
+avg_pool3d = _avg_pool('avg_pool3d', _triple)
 
 
 def reflection_pad(g, input, padding):
@@ -452,7 +505,9 @@ def upsample_nearest2d(g, input, scale_factor):
                 height_scale_f=scale_factor, mode_s="nearest")
 
 
-def upsample_bilinear2d(g, input, output_size):
+def upsample_bilinear2d(g, input, output_size, align_corners):
+    if align_corners:
+        return _unimplemented("upsample_bilinear2d", "align_corners == True")
     w_scale = float(output_size[-1]) / input.type().sizes()[-1]
     h_scale = float(output_size[-2]) / input.type().sizes()[-2]
     return g.op("Upsample", input, width_scale_f=w_scale,
@@ -505,12 +560,19 @@ def _convolution(g, input, weight, bias, stride, padding, dilation,
 
 
 def batch_norm(g, input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled):
+    input_sizes = input.type().sizes()
+    if len(input_sizes) == 2:
+        # batchnorm1d accepts 2d and 3d array, but ONNX only accepts 3d
+        input = g.op("Unsqueeze", input, axes_i=[2])
+
     out = g.op("BatchNormalization", input, weight, bias, running_mean, running_var,
                is_test_i=not training,
                epsilon_f=eps,
                momentum_f=1 - momentum,
                outputs=1 if not training else 5)
     if not training:
+        if len(input_sizes) == 2:
+            out = g.op("Squeeze", out, axes_i=[2])
         return out
     else:
         res, new_running_mean, new_running_var, saved_mean, saved_var = out
@@ -518,6 +580,8 @@ def batch_norm(g, input, weight, bias, running_mean, running_var, training, mome
         new_running_var.setType(running_var.type())
         saved_mean.setUniqueName("batch_norm_dead_output-" + saved_mean.uniqueName())
         saved_var.setUniqueName("batch_norm_dead_output-" + saved_var.uniqueName())
+        if len(input_sizes) == 2:
+            res = g.op("Squeeze", res, axes_i=[2])
         return res
 
 
@@ -525,7 +589,9 @@ def unfold(g, input, dimension, size, step):
     return g.op("ATen", input, operator_s="unfold", dimension_i=dimension, size_i=size, step_i=step)
 
 
-def elu(g, input, alpha, inplace=False):
+def elu(g, input, alpha, scale):
+    if scale and scale != 1.:
+        return _unimplemented("scale", "does not support scale in Elu")
     # See Note [Export inplace]
     return g.op("Elu", input, alpha_f=_scalar(alpha))
 
@@ -543,8 +609,8 @@ def type_as(g, self, other):
         # no-op
         return self
     else:
-        # TODO: This should be pretty easy, just implement it with Cast
-        return _unimplemented("type_as", "non no-op application")
+        other_type_name = self.type().scalarType().lower()
+        return g.op("Cast", self, to_i=cast_pytorch_to_onnx[other_type_name])
 
 
 # ignore clone operators that are inserted by PyTorch autograd
@@ -626,19 +692,19 @@ def _unique(g, input, sorted, return_inverse):
 # TODO: remove these once we support Type's in the JIT IR and we can once again
 # use the unified toType operator
 cast_pytorch_to_onnx = {
-    'uint8_t': 'UINT8',
-    'int8_t': 'INT8',
-    'double': 'DOUBLE',
-    'float': 'FLOAT',
-    'Half': 'FLOAT16',
-    'int': 'INT32',
-    'int64_t': 'INT64',
-    'int16_t': 'INT16',
+    'uint8_t': torch.onnx.TensorProtoDataType.UINT8,
+    'int8_t': torch.onnx.TensorProtoDataType.INT8,
+    'double': torch.onnx.TensorProtoDataType.DOUBLE,
+    'float': torch.onnx.TensorProtoDataType.FLOAT,
+    'Half': torch.onnx.TensorProtoDataType.FLOAT16,
+    'int': torch.onnx.TensorProtoDataType.INT32,
+    'int64_t': torch.onnx.TensorProtoDataType.INT64,
+    'int16_t': torch.onnx.TensorProtoDataType.INT16,
 }
 
 
-def _cast_func_template(to_s, g, input, non_blocking):
-    return g.op("Cast", input, to_s=to_s)
+def _cast_func_template(to_i, g, input, non_blocking):
+    return g.op("Cast", input, to_i=to_i)
 
 
 for k, v in cast_pytorch_to_onnx.items():
@@ -667,6 +733,15 @@ def topk(g, self, k, dim=None, largest=True, sorted=True, out=None):
         _unimplemented("TopK", "Ascending TopK is not supported")
 
     return g.op("TopK", self, k_i=k, axis_i=dim, outputs=2)
+
+
+def repeat(g, self, repeats):
+    if self.isTensor():
+        sizes = self.type().sizes()
+        diff_dims = len(repeats) - len(sizes)
+        if diff_dims > 0:
+            self = view(g, self, [1] * diff_dims + sizes)
+    return g.op("Tile", self, g.op("Constant", value_t=torch.LongTensor(repeats)))
 
 
 def instance_norm(g, input, **kwargs):
@@ -852,3 +927,113 @@ def GRU_symbolic_builder(input_size, hidden_size, num_layers, batch_first, dropo
         return prev_output, h_outs
 
     return symbolic
+
+
+# WARNING: Here be dragons. i.e. this is a hack that should die in a fire
+#
+# Since we need RNN nodes to work both in the GraphExecutor as well as call the
+# correct symbolic function during ONNX export, we do the following:
+#
+# 1. During tracing we dispatch to this function
+# 2. This function emits a PythonOp wrapping the RNN function that would have
+#    run had we not been tracing. Thus, GraphExecutor will call the RNN operator
+#    via Python. In the future we will likely want to make the RNN modules into
+#    ScriptModules so we can optimize them.
+# 3. We store a wrapper around the ONNX symbolic function in the `symbolic`
+#    attribute of the Python function. The ONNX export pass accesses this
+#    attribute during tracing and calls it to lower the PythonOp into the right
+#    thing
+#
+# The first three parameters to this function are meant to be bound with:
+#   cell_type - The string description of the type of RNN cell. e.g. 'LSTM'
+#   func - The function that would have been called here if we had not been
+#          tracing, e.g. CudnnRNN or AutogradRNN.
+#   sym - The ONNX symbolic we should store in the PythonOp for later export.
+#
+# With those three parameters bound, we can pass the function into the
+# torch.onnx.symbolic_override* functions
+#
+# The remaining arguments are equivalent to the inputs seen when dispatching
+# a symbolic function for an operator. Concretely:
+#  * input - a single input tensor [seq_len, batch, input_size] or if bach_first=True,
+#            [batch, seq_len, input_size]
+#  * weights - list of list of tensors. len(weights) = number of layers
+#              weights[i] is a list of weights, same as the parameters to
+#              torch.nn.{RNN,LSTM,GRU}. See the symbolic builders above
+#  * hiddens - hidden state for the first layer, or {hidden state, cell state} if
+#              cell_type == LSTM
+#  * batch_sizes - 1-D tensor containing the sequence length for each example
+#                  in the batch.
+def rnn_trace_override_symbolic(cell_type, func, sym, g, input, weights, hiddens, batch_sizes):
+    num_layers = len(weights)
+    num_weights = 0
+    for x in weights:
+        num_weights += len(x)
+    weights_per_layer = num_weights // num_layers
+    has_batch_sizes = batch_sizes is not None
+
+    # Since we need flat argument lists in the IR, these two functions and the
+    # supporting code before the `wrapPyFuncWithSymbolic` call are simply
+    # helpers to reconstruct the input, weights, hiddens, and batch_sizes
+    # inputs from the flat argument list. To do this, the above code captures
+    # then lengths of each of these inputs so that we can rematerialize them
+    # later before calling either the RNN function or the ONNX symbolic function
+
+    def forward_flattened_wrapper(input, *args):
+        args_offset = 0
+        weights = []
+        for _ in range(num_layers):
+            weights.append(args[args_offset:args_offset + weights_per_layer])
+            args_offset += weights_per_layer
+        if has_batch_sizes:
+            hiddens = args[args_offset:-1]
+            batch_sizes = args[-1]
+        else:
+            hiddens = args[args_offset:]
+            batch_sizes = None
+        if cell_type != 'LSTM':
+            assert len(hiddens) == 1
+            hiddens = hiddens[0]
+        outputs = func(input, weights, hiddens, batch_sizes)
+        # We also need a flattened output list
+        outs_flattened = [outputs[0]]
+        if cell_type == 'LSTM':
+            for o in outputs[1]:
+                outs_flattened.append(o)
+        else:
+            outs_flattened.append(outputs[1])
+        return tuple(outs_flattened)
+
+    def symbolic_flattened_wrapper(g, input, *args):
+        args_offset = 0
+        weights = []
+        for _ in range(num_layers):
+            weights.append(args[args_offset:args_offset + weights_per_layer])
+            args_offset += weights_per_layer
+        if has_batch_sizes:
+            hiddens = args[args_offset:-1]
+            batch_sizes = args[-1]
+        else:
+            hiddens = args[args_offset:]
+            batch_sizes = None
+        if cell_type != 'LSTM':
+            assert len(hiddens) == 1
+            hiddens = hiddens[0]
+        return sym(g, input, weights, hiddens, batch_sizes)
+
+    flattened_weights = []
+    for x in weights:
+        for y in x:
+            flattened_weights.append(y)
+    if not isinstance(hiddens, Iterable):
+        hiddens = [hiddens]
+    inputs = list(itertools.chain.from_iterable(
+        [[input], flattened_weights, hiddens,
+            [batch_sizes] if batch_sizes else []]))
+    outputs = g.wrapPyFuncWithSymbolic(
+        forward_flattened_wrapper,
+        inputs,
+        3 if cell_type == 'LSTM' else 2,
+        symbolic_flattened_wrapper
+    )
+    return tuple(o for o in outputs)
