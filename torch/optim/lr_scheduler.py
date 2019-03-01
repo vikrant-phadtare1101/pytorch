@@ -1,7 +1,6 @@
 import math
 from bisect import bisect_right
 from functools import partial
-
 from .optimizer import Optimizer
 
 
@@ -22,6 +21,29 @@ class _LRScheduler(object):
         self.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
         self.step(last_epoch + 1)
         self.last_epoch = last_epoch
+
+    def __getstate__(self):
+        return self.state_dict()
+
+    def __setstate__(self, state):
+        self.load_state_dict(state)
+
+    def state_dict(self):
+        """Returns the state of the scheduler as a :class:`dict`.
+
+        It contains an entry for every variable in self.__dict__ which
+        is not the optimizer.
+        """
+        return {key: value for key, value in self.__dict__.items() if key != 'optimizer'}
+
+    def load_state_dict(self, state_dict):
+        """Loads the schedulers state.
+
+        Arguments:
+            state_dict (dict): scheduler state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        self.__dict__.update(state_dict)
 
     def get_lr(self):
         raise NotImplementedError
@@ -55,6 +77,7 @@ class LambdaLR(_LRScheduler):
         >>>     train(...)
         >>>     validate(...)
     """
+
     def __init__(self, optimizer, lr_lambda, last_epoch=-1):
         self.optimizer = optimizer
         if not isinstance(lr_lambda, list) and not isinstance(lr_lambda, tuple):
@@ -216,7 +239,11 @@ class ReduceLROnPlateau(object):
         factor (float): Factor by which the learning rate will be
             reduced. new_lr = lr * factor. Default: 0.1.
         patience (int): Number of epochs with no improvement after
-            which learning rate will be reduced. Default: 10.
+            which learning rate will be reduced. For example, if
+            `patience = 2`, then we will ignore the first 2 epochs
+            with no improvement, and will only decrease the LR after the
+            3rd epoch if the loss still hasn't improved then.
+            Default: 10.
         verbose (bool): If ``True``, prints a message to stdout for
             each update. Default: ``False``.
         threshold (float): Threshold for measuring the new optimum,

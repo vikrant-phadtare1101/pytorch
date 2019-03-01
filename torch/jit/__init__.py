@@ -60,8 +60,8 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
         A JIT compiled function/module may be compiled multiple times, as
         different inputs can result in different traces.  Currently, the
         JIT compiler conservatively assumes the trace may change if the
-        `size` or `requires_grad` of `Variable` inputs change, or if
-        any of the non-Variable inputs change.  For example, if you JIT
+        `size` or `requires_grad` of `Tensor` inputs change, or if
+        any of the non-Tensor inputs change.  For example, if you JIT
         compile an RNN which takes the number of hidden units as a parameter,
         we will compile a trace for every RNN length you use at runtime.
 
@@ -130,7 +130,7 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
 
     Example: Compile as function decorator.  The same modes of use for the class
     decorator are also supported for functions; however, the decorated
-    function must declare *all* Variable inputs in its arguments.
+    function must declare *all* Tensor inputs in its arguments.
 
         >>> @jit.compile
         >>> def f(x):
@@ -226,7 +226,7 @@ def get_trace_graph(f, args=tuple(), kwargs=None, nderivs=0):
     Arguments:
         f (torch.nn.Module or function): the function or module
             to be traced.
-        args (tuple or Variable): the positional arguments to pass to the
+        args (tuple or Tensor): the positional arguments to pass to the
             function/module to be traced.  A non-tuple is assumed to
             be a single positional argument to be passed to the model.
         kwargs (dict): the keyword arguments to pass to the function/module
@@ -296,15 +296,16 @@ def _clone_inputs(args):
     def clone_input(a):
         if a is None:
             return None
-        elif isinstance(a, Variable):
+        elif isinstance(a, torch.Tensor):
+            # TODO: figure out one liner to .clone() and set requires_grad
             v = Variable(a.data.clone(), requires_grad=a.requires_grad)
             if a.grad is not None:
                 v.grad = clone_input(v.grad)
             return v
         else:
             return a.clone()
-    return function._nested_map(lambda o: isinstance(o, Variable) or torch.is_tensor(o),
-                                clone_input, condition_msg="Variables")(args)
+    return function._nested_map(lambda x: isinstance(x, torch.Tensor),
+                                clone_input, condition_msg="tensors")(args)
 
 
 # This is purely for developer debugging.  We are not going to advertise it.
@@ -360,7 +361,7 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
         model (compiled torch.nn.Module or function): the module/function to be
             verified.  The module/function definition MUST have been decorated with
             `@torch.jit.compile`.
-        args (tuple or Variable): the positional arguments to pass to the
+        args (tuple or Tensor): the positional arguments to pass to the
             compiled function/module to be verified.  A non-tuple is assumed to
             be a single positional argument to be passed to the model.
         loss_fn (function, optional): the loss function to be applied to
@@ -456,9 +457,9 @@ def trace(*args, **kwargs):
     Keyword arguments:
         optimize (bool, optional): whether or not to apply optimizations.  Default: ``True``.
 
-        >>> @jit.trace(torch.autograd.Variable(torch.rand(1)))
-        >>> def f(x):
-        >>>     return x * 2
+        >>> @jit.trace(torch.rand(1))
+        ... def f(x):
+        ...     return x * 2
     """
     def wrapper(func):
         executor_options = {'optimize': True}
@@ -476,7 +477,7 @@ def trace(*args, **kwargs):
     return wrapper
 
 
-def createResolutionCallback(frame_id=2):
+def createResolutionCallback(frames_up=0):
     """
     Creates a function which, given a string variable name,
     returns the value of the variable in the scope of the caller of
@@ -495,8 +496,10 @@ def createResolutionCallback(frame_id=2):
 
     This is used to enable access in-scope Python variables inside
     TorchScript fragments.
+
+    frames_up is
     """
-    frame = inspect.stack()[frame_id][0]
+    frame = inspect.stack()[1 + frames_up][0]
 
     def env(key):
         if key in frame.f_locals:
@@ -510,30 +513,30 @@ def createResolutionCallback(frame_id=2):
 
 
 class CompilationUnit(object):
-    def __init__(self, lang=None, optimize=True):
+    def __init__(self, lang=None, optimize=True, _frames_up=0):
         self.module = torch._C.ScriptModule()
         self.module._set_optimized(optimize)
         if lang is not None:
-            self.define(lang, frame_id=3)
+            self.define(lang, _frames_up=_frames_up + 1)
         self.optimize = optimize
 
-    def define(self, lang, rcb=None, frame_id=2):
+    def define(self, lang, rcb=None, _frames_up=0):
         if not rcb:
-            rcb = createResolutionCallback(frame_id)
+            rcb = createResolutionCallback(_frames_up + 1)
         self.module._define(lang, rcb, False)
 
     def __getattr__(self, attr):
         return self.module._get_method(attr)
 
 
-def _script_graph(fn, frame_id=2):
-    rcb = createResolutionCallback(frame_id)
+def _script_graph(fn, _frames_up=0):
+    rcb = createResolutionCallback(_frames_up + 1)
     ast = get_jit_ast(fn)
     return _jit_script_compile(ast, rcb)
 
 
-def script(fn):
-    graph = _script_graph(fn, frame_id=3)
+def script(fn, _frames_up=0):
+    graph = _script_graph(fn, _frames_up=_frames_up + 1)
     return torch._C.GraphExecutor(graph, True)
 
 
@@ -541,7 +544,7 @@ ScriptMethodStub = namedtuple('ScriptMethodStub', ('resolution_callback', 'ast')
 
 
 def script_method(fn):
-    return ScriptMethodStub(createResolutionCallback(), get_jit_ast(fn))
+    return ScriptMethodStub(createResolutionCallback(frames_up=1), get_jit_ast(fn))
 
 
 # These OrderedDictWrapper classes replace the actual OrderedDicts in
@@ -556,6 +559,7 @@ def script_method(fn):
 #  del view[name]
 #  view.items()
 #  view.keys()
+#  len(view)
 
 class OrderedDictWrapper(object):
     def __init__(self, module):
@@ -715,8 +719,9 @@ class ScriptMeta(type(torch._C.ScriptModule)):
             if cls is type(self):
                 torch._C.ScriptModule.__init__(self)
             original_init(self, *args, **kwargs)
-            for m in methods:
-                self._create_method(m.ast, m.resolution_callback)
+            asts = [m.ast for m in methods]
+            rcbs = [m.resolution_callback for m in methods]
+            self._create_methods(asts, rcbs)
 
         cls.__init__ = init_then_register
         return super(ScriptMeta, cls).__init__(name, bases, attrs)
@@ -759,7 +764,7 @@ class ScriptModule(with_metaclass(ScriptMeta, Module, torch._C.ScriptModule)):
         return self.__getattr__('forward')(*args, **kwargs)
 
     def define(self, lang):
-        rcb = createResolutionCallback()
+        rcb = createResolutionCallback(frames_up=1)
         self._define(lang, rcb, True)
 
 
@@ -772,9 +777,9 @@ def _get_methods(cls):
 _compiled_methods_whitelist = {
     'forward', 'register_buffer', 'register_parameter', 'add_module',
     '_apply', 'apply', 'cuda', 'cpu', 'type', 'float', 'double', 'half',
-    'state_dict', 'load_state_dict', 'parameters', 'named_parameters',
-    '_all_buffers', 'children', 'named_children', 'modules', 'named_modules',
-    'zero_grad', 'share_memory', '_get_name'
+    'state_dict', 'load_state_dict', '_load_from_state_dict', 'parameters',
+    'named_parameters', '_all_buffers', 'children', 'named_children', 'modules',
+    'named_modules', 'zero_grad', 'share_memory', '_get_name', 'extra_repr'
 }
 
 

@@ -6,7 +6,9 @@
 #include "torch/csrc/Exceptions.h"
 #include "torch/csrc/Size.h"
 #include "torch/csrc/autograd/python_variable.h"
+#include "torch/csrc/autograd/utils/python_error_messages.h"
 #include "torch/csrc/autograd/utils/wrap_outputs.h"
+#include "torch/csrc/jit/tracer.h"
 #ifdef WITH_CUDA
 #include "torch/csrc/cuda/Stream.h"
 #endif
@@ -67,7 +69,7 @@ static PyObject * THPVariable_clamp(PyObject* self, PyObject* args, PyObject* kw
   HANDLE_TH_ERRORS
   static PythonArgParser parser({
     "clamp(Scalar min=None, Scalar max=None)",
-  });
+  }, /*traceable=*/true);
   auto& self_ = reinterpret_cast<THPVariable*>(self)->cdata;
   ParsedArgs<2> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
@@ -104,7 +106,7 @@ static PyObject * THPVariable_clamp_(PyObject* self, PyObject* args, PyObject* k
   HANDLE_TH_ERRORS
   static PythonArgParser parser({
     "clamp_(Scalar min=None, Scalar max=None)",
-  });
+  }, /*traceable=*/true);
   auto& self_ = reinterpret_cast<THPVariable*>(self)->cdata;
   ParsedArgs<2> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
@@ -131,13 +133,15 @@ static PyObject * THPVariable_size(PyObject* self, PyObject* args, PyObject* kwa
   ParsedArgs<3> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
   if (r.idx == 0) {
-    return wrap(self_.size(r.toInt64(0)));
+    if (jit::tracer::isTracing(self_)) {
+      return wrap(jit::tracer::getSizeOf(self_, r.toInt64(0)));
+    } else {
+      return wrap(self_.size(r.toInt64(0)));
+    }
   } else if (r.idx == 1) {
-    // Yes, this is called sizes in ATen
-    IntList sizes = self_.sizes();
     // we can't do the normal wrapping here because IntList maps to both
     // torch.Size and tuple in python.
-    return THPSize_New(sizes.size(), sizes.data());
+    return THPSize_New(self_);
   }
   Py_RETURN_NONE;
   END_HANDLE_TH_ERRORS
@@ -408,6 +412,29 @@ static PyObject * THPVariable_record_stream(PyObject* self, PyObject* arg)
   END_HANDLE_TH_ERRORS
 }
 
+static PyObject * THPVariable_requires_grad_(PyObject* self, PyObject* args, PyObject* kwargs)
+{
+  HANDLE_TH_ERRORS
+  static PythonArgParser parser({
+    "requires_grad_(bool requires_grad=True)",
+  });
+  auto& self_ = reinterpret_cast<THPVariable*>(self)->cdata;
+  ParsedArgs<1> parsed_args;
+  auto r = parser.parse(args, kwargs, parsed_args);
+  auto requires_grad = r.toBool(0);
+  // should we throw if requires_grad is true?  var.requires_grad = True throws here
+  // but it's nice to let this be a no-op.
+  if (!self_.is_leaf() && !requires_grad) {
+    throw std::runtime_error(autograd::utils::requires_grad_leaf_error(requires_grad));
+  }
+  if (requires_grad && !self_.is_floating_point()) {
+    throw std::runtime_error("only Tensors of floating point dtype can require gradients");
+  }
+  self_.set_requires_grad(requires_grad);
+  return THPVariable_Wrap(self_);
+  END_HANDLE_TH_ERRORS
+}
+
 static PyObject * THPVariable_item(PyObject* self, PyObject* args)
 {
   HANDLE_TH_ERRORS
@@ -532,7 +559,7 @@ static PyObject * THPVariable_to(PyObject* self, PyObject* args, PyObject* kwarg
 {
   HANDLE_TH_ERRORS
   static PythonArgParser parser({
-    "to(Device device, *, ScalarType dtype=None)",
+    "to(Device device, ScalarType dtype=None)",
     "to(ScalarType dtype)",
     "to(Tensor other)",
   });
@@ -661,6 +688,7 @@ PyMethodDef variable_methods[] = {
   {"new_zeros", (PyCFunction)THPVariable_new_zeros, METH_VARARGS | METH_KEYWORDS, NULL},
   {"numpy", (PyCFunction)THPVariable_numpy, METH_NOARGS, NULL},
   {"record_stream", (PyCFunction)THPVariable_record_stream, METH_O, NULL},
+  {"requires_grad_", (PyCFunction)THPVariable_requires_grad_, METH_VARARGS | METH_KEYWORDS, NULL},
   {"short", (PyCFunction)THPVariable_short, METH_NOARGS, NULL},
   {"size", (PyCFunction)THPVariable_size, METH_VARARGS | METH_KEYWORDS, NULL},
   {"storage", (PyCFunction)THPVariable_storage, METH_NOARGS, NULL},

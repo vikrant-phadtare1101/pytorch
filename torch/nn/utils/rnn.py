@@ -1,7 +1,6 @@
 from collections import namedtuple
 
 import torch
-from torch.autograd import Variable
 import torch.onnx
 
 
@@ -26,8 +25,8 @@ class PackedSequence(PackedSequence_):
         ``batch_sizes=[2,1,1]``.
 
     Attributes:
-        data (Variable): Variable containing packed sequence
-        batch_sizes (Variable): Variable of integers holding
+        data (Tensor): Tensor containing packed sequence
+        batch_sizes (Tensor): Tensor of integers holding
             information about the batch size at each sequence step
 
     """
@@ -86,6 +85,23 @@ class PackedSequence(PackedSequence_):
         r"""Returns copy with `self.data` cast to byte type"""
         return type(self)(self.data.byte(), self.batch_sizes)
 
+    def to(self, *args, **kwargs):
+        r"""Performs dtype and/or device conversion on `self.data`.
+
+        It has similar signature as :meth:`torch.Tensor.to`.
+
+        .. note::
+
+            If the ``self.data`` Tensor already has the correct :class:`torch.dtype`
+            and :class:`torch.device`, then ``self`` is returned.
+            Otherwise, returns a copy with the desired configuration.
+        """
+        data = self.data.to(*args, **kwargs)
+        if data is self.data:
+            return self
+        else:
+            return type(self)(data, self.batch_sizes)
+
     @property
     def is_cuda(self):
         r"""Returns true if `self.data` stored on a gpu"""
@@ -93,7 +109,7 @@ class PackedSequence(PackedSequence_):
 
 
 def pack_padded_sequence(input, lengths, batch_first=False):
-    r"""Packs a Variable containing padded sequences of variable length.
+    r"""Packs a Tensor containing padded sequences of variable length.
 
     Input can be of size ``T x B x *`` where `T` is the length of the longest sequence
     (equal to ``lengths[0]``), `B` is the batch size, and `*` is any number of
@@ -107,12 +123,12 @@ def pack_padded_sequence(input, lengths, batch_first=False):
     Note:
         This function accepts any input that has at least two dimensions. You
         can apply it to pack the labels, and use the output of the RNN with
-        them to compute the loss directly. A Variable can be retrieved from
+        them to compute the loss directly. A Tensor can be retrieved from
         a :class:`PackedSequence` object by accessing its ``.data`` attribute.
 
     Arguments:
-        input (Variable): padded batch of variable length sequences.
-        lengths (Variable): list of sequences lengths of each batch element.
+        input (Tensor): padded batch of variable length sequences.
+        lengths (Tensor): list of sequences lengths of each batch element.
         batch_first (bool, optional): if ``True``, the input is expected in ``B x T x *``
             format.
 
@@ -120,7 +136,7 @@ def pack_padded_sequence(input, lengths, batch_first=False):
         a :class:`PackedSequence` object
     """
     if isinstance(lengths, list):
-        lengths = Variable(torch.LongTensor(lengths))
+        lengths = torch.LongTensor(lengths)
 
     data, batch_sizes = PackPadded.apply(input, lengths, batch_first)
 
@@ -157,7 +173,7 @@ def pad_packed_sequence(sequence, batch_first=False, padding_value=0.0, total_le
 
     It is an inverse operation to :func:`pack_padded_sequence`.
 
-    The returned Variable's data will be of size ``T x B x *``, where `T` is the length
+    The returned Tensor's data will be of size ``T x B x *``, where `T` is the length
     of the longest sequence and `B` is the batch size. If ``batch_first`` is True,
     the data will be transposed into ``B x T x *`` format.
 
@@ -181,7 +197,7 @@ def pad_packed_sequence(sequence, batch_first=False, padding_value=0.0, total_le
             :attr:`sequence`.
 
     Returns:
-        Tuple of Variable containing the padded sequence, and Variable
+        Tuple of Tensor containing the padded sequence, and a Tensor
         containing the list of lengths of each sequence in the batch.
 
     """
@@ -196,7 +212,6 @@ def pad_packed_sequence(sequence, batch_first=False, padding_value=0.0, total_le
                              .format(total_length, max_seq_length))
         max_seq_length = total_length
     output = var_data.data.new(max_seq_length, max_batch_size, *var_data.size()[1:]).fill_(padding_value)
-    output = Variable(output)
 
     lengths = []
     data_offset = 0
@@ -218,11 +233,11 @@ def pad_packed_sequence(sequence, batch_first=False, padding_value=0.0, total_le
 
     if batch_first:
         output = output.transpose(0, 1)
-    # This Variable doesn't actually have any history (well,
+    # This Tensor doesn't actually have any history (well,
     # technically it does; it's just untracked), it is purely here to
     # make ONNX export easier. That is to say, from an autodiff
     # standpoint this doesn't make any sense.
-    return output, Variable(torch.LongTensor(lengths))
+    return output, torch.LongTensor(lengths)
 
 
 def _symbolic_pad_packed_sequence(g, input, batch_first=False, padding_value=0.0):
@@ -247,10 +262,10 @@ pad_packed_sequence = torch.onnx.symbolic_override_packed_sequence_based(
 
 
 def pad_sequence(sequences, batch_first=False, padding_value=0):
-    r"""Pad a list of variable length Variables with zero
+    r"""Pad a list of variable length Tensors with zero
 
-    ``pad_sequence`` stacks a list of Variables along a new dimension,
-    and padds them to equal length. For example, if the input is list of
+    ``pad_sequence`` stacks a list of Tensors along a new dimension,
+    and pads them to equal length. For example, if the input is list of
     sequences with size ``L x *`` and if batch_first is False, and ``T x B x *``
     otherwise. The list of sequences should be sorted in the order of
     decreasing length.
@@ -262,30 +277,30 @@ def pad_sequence(sequences, batch_first=False, padding_value=0):
 
     Example:
         >>> from torch.nn.utils.rnn import pad_sequence
-        >>> a = Variable(torch.ones(25, 300))
-        >>> b = Variable(torch.ones(22, 300))
-        >>> c = Variable(torch.ones(15, 300))
+        >>> a = torch.ones(25, 300)
+        >>> b = torch.ones(22, 300)
+        >>> c = torch.ones(15, 300)
         >>> pad_sequence([a, b, c]).size()
         torch.Size([25, 3, 300])
 
     Note:
-        This function returns a Variable of size ``T x B x *`` or ``B x T x *`` where `T` is the
+        This function returns a Tensor of size ``T x B x *`` or ``B x T x *`` where `T` is the
             length of longest sequence.
-        Function assumes trailing dimensions and type of all the Variables
+        Function assumes trailing dimensions and type of all the Tensors
             in sequences are same.
 
     Arguments:
-        sequences (list[Variable]): list of variable length sequences.
+        sequences (list[Tensor]): list of variable length sequences.
         batch_first (bool, optional): output will be in ``B x T x *`` if True, or in
             ``T x B x *`` otherwise
         padding_value (float, optional): value for padded elements.
 
     Returns:
-        Variable of size ``T x B x *`` if batch_first is False
-        Variable of size ``B x T x *`` otherwise
+        Tensor of size ``T x B x *`` if batch_first is False
+        Tensor of size ``B x T x *`` otherwise
     """
 
-    # assuming trailing dimensions and type of all the Variables
+    # assuming trailing dimensions and type of all the Tensors
     # in sequences are same and fetching those from sequences[0]
     max_size = sequences[0].size()
     max_len, trailing_dims = max_size[0], max_size[1:]
@@ -295,48 +310,41 @@ def pad_sequence(sequences, batch_first=False, padding_value=0):
     else:
         out_dims = (max_len, len(sequences)) + trailing_dims
 
-    out_variable = Variable(sequences[0].data.new(*out_dims).fill_(padding_value))
-    for i, variable in enumerate(sequences):
-        length = variable.size(0)
+    out_tensor = sequences[0].data.new(*out_dims).fill_(padding_value)
+    for i, tensor in enumerate(sequences):
+        length = tensor.size(0)
         # temporary sort check, can be removed when we handle sorting internally
         if prev_l < length:
-            raise ValueError("lengths array has to be sorted in decreasing order")
+            raise ValueError(
+                "sequences must be sorted in the order of decreasing length")
         prev_l = length
-        # use index notation to prevent duplicate references to the variable
+        # use index notation to prevent duplicate references to the tensor
         if batch_first:
-            out_variable[i, :length, ...] = variable
+            out_tensor[i, :length, ...] = tensor
         else:
-            out_variable[:length, i, ...] = variable
+            out_tensor[:length, i, ...] = tensor
 
-    return out_variable
+    return out_tensor
 
 
 def pack_sequence(sequences):
-    r"""Packs a list of variable length Variables
+    r"""Packs a list of variable length Tensors
 
-    ``sequences`` should be a list of Variables of size ``L x *``, where `L` is
+    ``sequences`` should be a list of Tensors of size ``L x *``, where `L` is
     the length of a sequence and `*` is any number of trailing dimensions,
     including zero. They should be sorted in the order of decreasing length.
 
     Example:
         >>> from torch.nn.utils.rnn import pack_sequence
-        >>> a = Variable(torch.Tensor([1,2,3]))
-        >>> b = Variable(torch.Tensor([4,5]))
-        >>> c = Variable(torch.Tensor([6]))
+        >>> a = torch.tensor([1,2,3])
+        >>> b = torch.tensor([4,5])
+        >>> c = torch.tensor([6])
         >>> pack_sequence([a, b, c]])
-        PackedSequence(data=
-         1
-         4
-         6
-         2
-         5
-         3
-        [torch.FloatTensor of size 6]
-        , batch_sizes=[3, 2, 1])
+        PackedSequence(data=tensor([ 1,  4,  6,  2,  5,  3]), batch_sizes=tensor([ 3,  2,  1]))
 
 
     Arguments:
-        sequences (list[Variable]): A list of sequences of decreasing length.
+        sequences (list[Tensor]): A list of sequences of decreasing length.
 
     Returns:
         a :class:`PackedSequence` object
